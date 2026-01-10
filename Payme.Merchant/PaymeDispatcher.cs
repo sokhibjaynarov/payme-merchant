@@ -59,6 +59,7 @@ namespace Payme.Merchant
                     // Typically if we can't parse ID, we treat it as null id.
                     throw new PaymeException(PaymeErrorCodes.InvalidJson, "Invalid JSON-RPC");
                 }
+
                 id = request.Id;
 
                 // 3. Route Method
@@ -82,7 +83,8 @@ namespace Payme.Merchant
                         break;
                     case "GetStatement":
                         // result = await HandleGetStatementAsync(request.Params);
-                        throw new PaymeException(PaymeErrorCodes.MethodNotFound, "GetStatement is not fully implemented in this demo");
+                        throw new PaymeException(PaymeErrorCodes.MethodNotFound,
+                            "GetStatement is not fully implemented in this demo");
                     case "ChangePassword":
                         // Only needed if you support changing password via API, usually not for Merchant API.
                         result = new { success = true };
@@ -103,7 +105,8 @@ namespace Payme.Merchant
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "System error processing Payme request");
-                var response = new JsonRpcResponse(id ?? 0, new JsonRpcError(PaymeErrorCodes.SystemError, "Internal System Error"));
+                var response = new JsonRpcResponse(id ?? 0,
+                    new JsonRpcError(PaymeErrorCodes.SystemError, "Internal System Error"));
                 return JsonConvert.SerializeObject(response);
             }
         }
@@ -142,26 +145,30 @@ namespace Payme.Merchant
         {
             var p = DeserializeParams<CheckPerformTransactionDto>(requestParams);
 
-            // 1. Validate Order
             var orderId = p.Account?.OrderId;
             if (string.IsNullOrEmpty(orderId))
-                throw new PaymeException(PaymeErrorCodes.SystemError, "Account 'order_id' is missing"); // Or specific business error? Payme usually -31001? Or parameter error? 
-                                                                                                        // Spec implies: if params incorrect, maybe -32602 (Invalid params). 
-                                                                                                        // But let's check order existence first.
+                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
 
             if (!await _orderService.ExistsAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.OrderNotFound, "Order not found");
+                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
 
-            // 2. Validate Amount
             var amount = await _orderService.GetAmountAsync(orderId);
             if (amount != p.Amount)
-                throw new PaymeException(PaymeErrorCodes.WrongAmount, "Incorrect amount");
+                throw new PaymeException(PaymeErrorCodes.WrongAmount, PaymeErrors.WrongAmount, "amount");
 
-            // 3. Check if paid
             if (await _orderService.IsPaidAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Order already paid"); // Or specific code? -31008 usually.
+                throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState);
 
-            // 4. Return Allow
+            var existingTrans = await _transactionStore.GetByOrderIdAsync(orderId);
+            if (existingTrans != null)
+            {
+                if (existingTrans.State == (int)TransactionState.Created)
+                    throw new PaymeException(PaymeErrorCodes.Pending, PaymeErrors.Pending);
+
+                if (existingTrans.State == (int)TransactionState.Completed)
+                    throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState);
+            }
+
             return new CheckPerformTransactionResult
             {
                 Allow = true
@@ -172,69 +179,52 @@ namespace Payme.Merchant
         {
             var p = DeserializeParams<CreateTransactionDto>(requestParams);
             var orderId = p.Account?.OrderId;
-            if (string.IsNullOrEmpty(orderId)) throw new PaymeException(PaymeErrorCodes.OrderNotFound, "Order ID missing"); // Or -31050
+            if (string.IsNullOrEmpty(orderId))
+                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
 
             // 1. Check if Transaction exists
             var existing = await _transactionStore.GetAsync(p.Id);
 
             if (existing != null)
             {
-                // IDEMPOTENCY CHECK
                 if (existing.OrderId != orderId || existing.Amount != p.Amount)
                 {
-                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Transaction already exists with different parameters");
+                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
                 }
 
-                // If exists, checks state
-                if (existing.State != (int)TransactionState.Created)
+                if (existing.State == (int)TransactionState.Created)
                 {
-                    // If it's already perform/cancelled, what to return? 
-                    // CreateTransaction should return result if it's strictly the same transaction.
-                    // But spec says: if active transaction exists, return it. 
-                    // If transaction is cancelled or completed?
-                    // If cancelled (-1), we usually can't re-create with same ID? 
-                    // Payme usually doesn't re-send same ID for different attempt.
-                    // If state is 1, return it.
-                    if (existing.State == (int)TransactionState.Created)
+                    return new CreateTransactionResult
                     {
-                        return new CreateTransactionResult
-                        {
-                            CreateTime = existing.CreateTime,
-                            Transaction = existing.Id,
-                            State = existing.State
-                        };
-                    }
-                    else
-                    {
-                        // Standard Payme: If state is not 1, usually log error or return current state?
-                        // Spec: If user tries to Create existing transaction which is done/cancelled --> error -31008 "Transaction already finished/cancelled"
-                        throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Transaction already processed");
-                    }
+                        CreateTime = existing.CreateTime,
+                        Transaction = existing.Id,
+                        State = existing.State
+                    };
                 }
-
-                return new CreateTransactionResult
+                else
                 {
-                    CreateTime = existing.CreateTime,
-                    Transaction = existing.Id,
-                    State = existing.State
-                };
+                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
+                }
             }
 
             // 2. Check Perform Conditions (Order exists, amount correct, not paid)
-            // CheckPerformTransaction logic reuse or recheck
             if (!await _orderService.ExistsAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.OrderNotFound, "Order not found");
+                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
 
             var amount = await _orderService.GetAmountAsync(orderId);
             if (amount != p.Amount)
-                throw new PaymeException(PaymeErrorCodes.WrongAmount, "Incorrect amount");
+                throw new PaymeException(PaymeErrorCodes.WrongAmount, PaymeErrors.WrongAmount, "amount");
 
-            if (await _orderService.IsPaidAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Order already paid");
+            var activeTrans = await _transactionStore.GetByOrderIdAsync(orderId);
+            if (activeTrans != null)
+            {
+                if (activeTrans.State == (int)TransactionState.Completed)
+                    throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState);
 
-            // 3. Create Transaction
-            // Note: p.Time is from Payme. We might use current time or Payme time. 
-            // Ideally we store Payme time as 'create_time'.
+                if (activeTrans.State == (int)TransactionState.Created)
+                    throw new PaymeException(PaymeErrorCodes.InProgress, PaymeErrors.InProgress);
+            }
+
             await _transactionStore.CreateAsync(p.Id, orderId, p.Time, p.Amount);
 
             return new CreateTransactionResult
@@ -252,20 +242,19 @@ namespace Payme.Merchant
 
             if (trans == null)
             {
-                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, "Transaction not found");
+                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
             }
 
             // State Machine
             if (trans.State == (int)TransactionState.Created)
             {
-                // Verify not expired? (Check CreateTime vs Now if strict timeout needed: 43200000 ms = 12 hours)
                 if (DateTimeOffset.Now.ToUnixTimeMilliseconds() - trans.CreateTime > 43200000)
                 {
-                    await _transactionStore.CancelAsync(trans.Id, DateTimeOffset.Now.ToUnixTimeMilliseconds(), -1, (int)TransactionState.Cancelled);
-                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Transaction expired");
+                    await _transactionStore.CancelAsync(trans.Id, DateTimeOffset.Now.ToUnixTimeMilliseconds(), -1,
+                        (int)TransactionState.Cancelled);
+                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
                 }
 
-                // MARK PAID
                 await _orderService.MarkAsPaidAsync(trans.OrderId);
                 var performTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
                 await _transactionStore.PerformAsync(trans.Id, performTime);
@@ -288,7 +277,7 @@ namespace Payme.Merchant
                 };
             }
 
-            throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Cannot perform transaction in current state");
+            throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
         }
 
         private async Task<CancelTransactionResult> HandleCancelTransactionAsync(object requestParams)
@@ -298,11 +287,12 @@ namespace Payme.Merchant
 
             if (trans == null)
             {
-                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, "Transaction not found");
+                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
             }
 
             // Already Cancelled
-            if (trans.State == (int)TransactionState.Cancelled || trans.State == (int)TransactionState.CancelledAfterComplete)
+            if (trans.State == (int)TransactionState.Cancelled ||
+                trans.State == (int)TransactionState.CancelledAfterComplete)
             {
                 return new CancelTransactionResult
                 {
@@ -329,37 +319,10 @@ namespace Payme.Merchant
 
             if (trans.State == (int)TransactionState.Completed)
             {
-                // Refund logic if needed, or just mark as cancelled_after_complete
-                // First verify if we can cancel completed? 
-                // Payme allows cancelling completed transactions (Refund).
-                // User needs to handle the refund in logic.
-
-                // Business check: Can we refund?
-                // If the user's MarkAsPaid has side effects (shipped goods), maybe we prevent?
-                // But Payme demands we handle it or return error if impossible.
-
-                // We assert OrderService.CancelAsync logic.
-                try
-                {
-                    await _orderService.CancelAsync(trans.OrderId, p.Reason);
-                }
-                catch
-                {
-                    // If business logic forbids cancellation?
-                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Cannot cancel completed transaction");
-                }
-
-                await _transactionStore.CancelAsync(trans.Id, cancelTime, p.Reason, (int)TransactionState.CancelledAfterComplete);
-
-                return new CancelTransactionResult
-                {
-                    CancelTime = cancelTime,
-                    Transaction = trans.Id,
-                    State = (int)TransactionState.CancelledAfterComplete
-                };
+                throw new PaymeException(PaymeErrorCodes.CantCancel, PaymeErrors.UnableToCancel);
             }
 
-            throw new PaymeException(PaymeErrorCodes.UnableToComplete, "Unknown state");
+            throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
         }
 
         private async Task<CheckTransactionResult> HandleCheckTransactionAsync(object requestParams)
@@ -368,7 +331,7 @@ namespace Payme.Merchant
             var trans = await _transactionStore.GetAsync(p.Id);
 
             if (trans == null)
-                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, "Transaction not found");
+                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
 
             return new CheckTransactionResult
             {
@@ -397,7 +360,9 @@ namespace Payme.Merchant
                 {
                     return jo.ToObject<T>() ?? throw new Exception();
                 }
-                return JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(urlParams)) ?? throw new Exception();
+
+                return JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(urlParams)) ??
+                       throw new Exception();
             }
         }
     }

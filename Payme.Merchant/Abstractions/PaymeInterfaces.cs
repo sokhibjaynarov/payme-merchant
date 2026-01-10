@@ -7,7 +7,7 @@ namespace Payme.Merchant.Abstractions
     {
         Task<bool> ExistsAsync(string orderId);
         Task<bool> IsPaidAsync(string orderId);
-        Task<long> GetAmountAsync(string orderId); // tiyin
+        Task<long> GetAmountAsync(string orderId);
         Task MarkAsPaidAsync(string orderId);
         Task CancelAsync(string orderId, int reason);
     }
@@ -16,19 +16,16 @@ namespace Payme.Merchant.Abstractions
     {
         Task CreateAsync(string paymeTransactionId, string orderId, long time, long amount);
         Task<PaymeTransaction?> GetAsync(string paymeTransactionId);
+        Task<PaymeTransaction?> GetByOrderIdAsync(string orderId);
         Task PerformAsync(string paymeTransactionId, long performTime);
         Task CancelAsync(string paymeTransactionId, long cancelTime, int reason, int newState);
-
-        // For GetStatement if needed, or we just return list
-        // Task<List<PaymeTransaction>> GetStatementAsync(long from, long to);
     }
 
-    // We need a PaymeTransaction model for the store to return.
     public class PaymeTransaction
     {
-        public string Id { get; set; } = default!; // Payme ID
+        public string Id { get; set; } = default!;
         public string OrderId { get; set; } = default!;
-        public long Time { get; set; } // Create Time
+        public long Time { get; set; }
         public long Amount { get; set; }
         public int State { get; set; }
         public long CreateTime { get; set; }

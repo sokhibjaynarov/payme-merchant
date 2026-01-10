@@ -4,14 +4,15 @@ namespace Payme.Merchant.Models.JsonRpc
 {
     public class JsonRpcResponse
     {
-        [JsonProperty("result")]
+        [JsonProperty("jsonrpc")] public string Version { get; } = "2.0";
+
+        [JsonProperty("result", NullValueHandling = NullValueHandling.Ignore)]
         public object? Result { get; set; }
 
-        [JsonProperty("error")]
+        [JsonProperty("error", NullValueHandling = NullValueHandling.Ignore)]
         public JsonRpcError? Error { get; set; }
 
-        [JsonProperty("id")]
-        public object Id { get; set; }
+        [JsonProperty("id")] public object Id { get; set; }
 
         public JsonRpcResponse(object id, object? result)
         {

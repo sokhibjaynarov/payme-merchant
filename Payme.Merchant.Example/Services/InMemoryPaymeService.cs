@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Threading.Tasks;
 using Payme.Merchant.Abstractions;
 using Payme.Merchant.Models;
@@ -8,18 +9,14 @@ namespace Payme.Merchant.Example.Services
 {
     public class InMemoryPaymeService : IPaymeOrderService, IPaymeTransactionStore
     {
-        // Mock Data
         private readonly ConcurrentDictionary<string, Order> _orders = new();
         private readonly ConcurrentDictionary<string, PaymeTransaction> _transactions = new();
 
         public InMemoryPaymeService()
         {
-            // Seed some orders
-            _orders.TryAdd("1001", new Order { Id = "1001", Amount = 100000, IsPaid = false }); // 1000.00 UZS
-            _orders.TryAdd("1002", new Order { Id = "1002", Amount = 500000, IsPaid = false }); // 5000.00 UZS
+            _orders.TryAdd("1001", new Order { Id = "1001", Amount = 100000, IsPaid = false });
+            _orders.TryAdd("1002", new Order { Id = "1002", Amount = 500000, IsPaid = false });
         }
-
-        // --- Order Service ---
 
         public Task<bool> ExistsAsync(string orderId)
         {
@@ -32,6 +29,7 @@ namespace Payme.Merchant.Example.Services
             {
                 return Task.FromResult(order.Amount);
             }
+
             return Task.FromResult(0L);
         }
 
@@ -41,6 +39,7 @@ namespace Payme.Merchant.Example.Services
             {
                 return Task.FromResult(order.IsPaid);
             }
+
             return Task.FromResult(false);
         }
 
@@ -50,6 +49,7 @@ namespace Payme.Merchant.Example.Services
             {
                 order.IsPaid = true;
             }
+
             return Task.CompletedTask;
         }
 
@@ -57,14 +57,11 @@ namespace Payme.Merchant.Example.Services
         {
             if (_orders.TryGetValue(orderId, out var order))
             {
-                // Business logic: e.g. unblock items if needed.
-                // If it was paid, maybe refund logic here.
-                order.IsPaid = false; // Just for demo
+                order.IsPaid = false;
             }
+
             return Task.CompletedTask;
         }
-
-        // --- Transaction Store ---
 
         public Task CreateAsync(string paymeTransactionId, string orderId, long time, long amount)
         {
@@ -74,7 +71,7 @@ namespace Payme.Merchant.Example.Services
                 OrderId = orderId,
                 Time = time,
                 Amount = amount,
-                CreateTime = DateTimeOffset.Now.ToUnixTimeMilliseconds(),
+                CreateTime = time,
                 State = (int)TransactionState.Created
             };
             _transactions.TryAdd(paymeTransactionId, t);
@@ -87,6 +84,12 @@ namespace Payme.Merchant.Example.Services
             return Task.FromResult(t);
         }
 
+        public Task<PaymeTransaction?> GetByOrderIdAsync(string orderId)
+        {
+            var t = _transactions.Values.FirstOrDefault(x => x.OrderId == orderId);
+            return Task.FromResult(t);
+        }
+
         public Task PerformAsync(string paymeTransactionId, long performTime)
         {
             if (_transactions.TryGetValue(paymeTransactionId, out var t))
@@ -94,6 +97,7 @@ namespace Payme.Merchant.Example.Services
                 t.State = (int)TransactionState.Completed;
                 t.PerformTime = performTime;
             }
+
             return Task.CompletedTask;
         }
 
@@ -101,10 +105,11 @@ namespace Payme.Merchant.Example.Services
         {
             if (_transactions.TryGetValue(paymeTransactionId, out var t))
             {
-                t.State = newState; // -1 or -2
+                t.State = newState;
                 t.CancelTime = cancelTime;
                 t.Reason = reason;
             }
+
             return Task.CompletedTask;
         }
 
