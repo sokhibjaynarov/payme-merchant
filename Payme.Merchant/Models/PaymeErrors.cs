@@ -3,9 +3,9 @@ namespace Payme.Merchant.Models
     public static class PaymeErrors
     {
         public static readonly PaymeErrorMessage OrderNotFound = new PaymeErrorMessage(
-            "Номер телефона не найден",
-            "Raqam ro'yhatda yo'q",
-            "Phone number not found"
+            "Заказ не найден",
+            "Buyurtma topilmadi",
+            "Order not found"
         );
 
         public static readonly PaymeErrorMessage WrongAmount = new PaymeErrorMessage(

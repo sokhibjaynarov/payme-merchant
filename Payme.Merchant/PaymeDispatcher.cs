@@ -1,10 +1,12 @@
 using System;
-using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Payme.Merchant.Abstractions;
 using Payme.Merchant.Configuration;
 using Payme.Merchant.Models;
@@ -13,356 +15,265 @@ using Payme.Merchant.Models.MethodDtos;
 
 namespace Payme.Merchant
 {
+    /// <summary>
+    /// Routes one Payme Merchant API call (JSON-RPC 2.0) to your order service and transaction store.
+    /// Always answer HTTP 200 with the returned JSON; Payme reads errors from the body, not the status.
+    /// </summary>
     public class PaymeDispatcher
     {
         private readonly PaymeOptions _options;
-        private readonly IPaymeOrderService _orderService;
-        private readonly IPaymeTransactionStore _transactionStore;
+        private readonly IPaymeOrderService _orders;
+        private readonly IPaymeTransactionStore _store;
+        private readonly TimeProvider _time;
         private readonly ILogger<PaymeDispatcher>? _logger;
 
         public PaymeDispatcher(
             IOptions<PaymeOptions> options,
             IPaymeOrderService orderService,
             IPaymeTransactionStore transactionStore,
+            TimeProvider? timeProvider = null,
             ILogger<PaymeDispatcher>? logger = null)
         {
             _options = options.Value;
-            _orderService = orderService;
-            _transactionStore = transactionStore;
+            _orders = orderService;
+            _store = transactionStore;
+            _time = timeProvider ?? TimeProvider.System;
             _logger = logger;
         }
 
-        public async Task<string> DispatchAsync(string authHeader, string requestBody)
+        private long Now => _time.GetUtcNow().ToUnixTimeMilliseconds();
+        private long TimeoutMs => (long)_options.TransactionTimeout.TotalMilliseconds;
+
+        public async Task<string> DispatchAsync(string? authHeader, string requestBody)
         {
             object? id = null;
             try
             {
-                // 1. Basic Auth Validation
-                if (!IsAuthorized(authHeader))
-                {
-                    throw new PaymeException(PaymeErrorCodes.AccessDenied, "Insufficient privileges");
-                }
-
-                // 2. Parse Request
                 JsonRpcRequest? request;
                 try
                 {
                     request = JsonConvert.DeserializeObject<JsonRpcRequest>(requestBody);
                 }
-                catch
+                catch (JsonException)
                 {
-                    throw new PaymeException(PaymeErrorCodes.InvalidJson, "Invalid JSON");
+                    throw new PaymeException(PaymeErrorCodes.InvalidJson, "Parse error");
                 }
 
-                if (request == null || string.IsNullOrEmpty(request.Method))
+                id = request?.Id;
+
+                // Payme's own test suite expects -32504 even for a well-formed request, so auth comes after
+                // parsing only to be able to echo the request id back.
+                if (!IsAuthorized(authHeader))
+                    throw new PaymeException(PaymeErrorCodes.AccessDenied, "Insufficient privileges");
+
+                if (request == null || string.IsNullOrEmpty(request.Method) || request.Params == null)
+                    throw new PaymeException(PaymeErrorCodes.InvalidRequest, "Invalid Request");
+
+                object result = request.Method switch
                 {
-                    // Typically if we can't parse ID, we treat it as null id.
-                    throw new PaymeException(PaymeErrorCodes.InvalidJson, "Invalid JSON-RPC");
-                }
+                    "CheckPerformTransaction" => await CheckPerformTransactionAsync(Params<CheckPerformTransactionDto>(request.Params)),
+                    "CreateTransaction" => await CreateTransactionAsync(Params<CreateTransactionDto>(request.Params)),
+                    "PerformTransaction" => await PerformTransactionAsync(Params<PerformTransactionDto>(request.Params)),
+                    "CancelTransaction" => await CancelTransactionAsync(Params<CancelTransactionDto>(request.Params)),
+                    "CheckTransaction" => await CheckTransactionAsync(Params<CheckTransactionDto>(request.Params)),
+                    "GetStatement" => await GetStatementAsync(Params<GetStatementDto>(request.Params)),
+                    _ => throw new PaymeException(PaymeErrorCodes.MethodNotFound, "Method not found", request.Method)
+                };
 
-                id = request.Id;
-
-                // 3. Route Method
-                object? result = null;
-                switch (request.Method)
-                {
-                    case "CheckPerformTransaction":
-                        result = await HandleCheckPerformTransactionAsync(request.Params);
-                        break;
-                    case "CreateTransaction":
-                        result = await HandleCreateTransactionAsync(request.Params);
-                        break;
-                    case "PerformTransaction":
-                        result = await HandlePerformTransactionAsync(request.Params);
-                        break;
-                    case "CancelTransaction":
-                        result = await HandleCancelTransactionAsync(request.Params);
-                        break;
-                    case "CheckTransaction":
-                        result = await HandleCheckTransactionAsync(request.Params);
-                        break;
-                    case "GetStatement":
-                        // result = await HandleGetStatementAsync(request.Params);
-                        throw new PaymeException(PaymeErrorCodes.MethodNotFound,
-                            "GetStatement is not fully implemented in this demo");
-                    case "ChangePassword":
-                        // Only needed if you support changing password via API, usually not for Merchant API.
-                        result = new { success = true };
-                        break;
-                    default:
-                        throw new PaymeException(PaymeErrorCodes.MethodNotFound, "Method not found");
-                }
-
-                // 4. Success Response
-                var response = new JsonRpcResponse(id ?? 0, result);
-                return JsonConvert.SerializeObject(response);
+                return JsonConvert.SerializeObject(new JsonRpcResponse(id ?? 0, result));
             }
             catch (PaymeException pe)
             {
-                var response = new JsonRpcResponse(id ?? 0, new JsonRpcError(pe.Code, pe.Message, pe.Data));
-                return JsonConvert.SerializeObject(response);
+                return JsonConvert.SerializeObject(new JsonRpcResponse(id ?? 0, new JsonRpcError(pe.Code, pe.Message, pe.Data)));
             }
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "System error processing Payme request");
-                var response = new JsonRpcResponse(id ?? 0,
-                    new JsonRpcError(PaymeErrorCodes.SystemError, "Internal System Error"));
-                return JsonConvert.SerializeObject(response);
+                return JsonConvert.SerializeObject(new JsonRpcResponse(id ?? 0,
+                    new JsonRpcError(PaymeErrorCodes.SystemError, "Internal System Error")));
             }
         }
 
-        private bool IsAuthorized(string authHeader)
+        private bool IsAuthorized(string? authHeader)
         {
-            if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Basic "))
-            {
+            if (string.IsNullOrEmpty(authHeader) || !authHeader!.StartsWith("Basic ", StringComparison.Ordinal))
                 return false;
-            }
 
+            string decoded;
             try
             {
-                var base64 = authHeader.Substring("Basic ".Length);
-                var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
-                var parts = decoded.Split(':');
-                if (parts.Length != 2) return false;
-
-                // Payme sends Login:Password. 
-                // We compare with our options.
-                return parts[0] == _options.Login && parts[1] == _options.Password;
+                decoded = Encoding.UTF8.GetString(Convert.FromBase64String(authHeader.Substring(6).Trim()));
             }
-            catch
+            catch (FormatException)
             {
                 return false;
             }
+
+            // The key itself may contain ':'; only the first one separates login from password.
+            var sep = decoded.IndexOf(':');
+            if (sep < 0) return false;
+
+            return FixedTimeEquals(decoded.Substring(0, sep), _options.Login)
+                   & FixedTimeEquals(decoded.Substring(sep + 1), _options.Password ?? string.Empty);
         }
 
-        // HANDLERS (To be moved to separate classes or kept here if simple enough, 
-        // but for quality I'll keep them here as private methods first, 
-        // to access _services easily while keeping state strict).
-        // Actually, creating separate Handler classes is cleaner but requires passing services. 
-        // Since the prompt asks for "Dispatching Payme methods internally", methods here are fine.
+        private static bool FixedTimeEquals(string a, string b) =>
+            CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(a), Encoding.UTF8.GetBytes(b));
 
-        private async Task<CheckPerformTransactionResult> HandleCheckPerformTransactionAsync(object requestParams)
+        private async Task<string> RequireOrderAsync(PaymeAccount? account, long amount)
         {
-            var p = DeserializeParams<CheckPerformTransactionDto>(requestParams);
-
-            var orderId = p.Account?.OrderId;
-            if (string.IsNullOrEmpty(orderId))
+            var orderId = account?.OrderId;
+            if (string.IsNullOrEmpty(orderId) || !await _orders.ExistsAsync(orderId!))
                 throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
 
-            if (!await _orderService.ExistsAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
-
-            var amount = await _orderService.GetAmountAsync(orderId);
-            if (amount != p.Amount)
+            if (await _orders.GetAmountAsync(orderId!) != amount)
                 throw new PaymeException(PaymeErrorCodes.WrongAmount, PaymeErrors.WrongAmount, "amount");
 
-            if (await _orderService.IsPaidAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState);
+            if (await _orders.IsPaidAsync(orderId!))
+                throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState, "order_id");
 
-            var existingTrans = await _transactionStore.GetByOrderIdAsync(orderId);
-            if (existingTrans != null)
-            {
-                if (existingTrans.State == (int)TransactionState.Created)
-                    throw new PaymeException(PaymeErrorCodes.Pending, PaymeErrors.Pending);
-
-                if (existingTrans.State == (int)TransactionState.Completed)
-                    throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState);
-            }
-
-            return new CheckPerformTransactionResult
-            {
-                Allow = true
-            };
+            return orderId!;
         }
 
-        private async Task<CreateTransactionResult> HandleCreateTransactionAsync(object requestParams)
+        private async Task<CheckPerformTransactionResult> CheckPerformTransactionAsync(CheckPerformTransactionDto p)
         {
-            var p = DeserializeParams<CreateTransactionDto>(requestParams);
-            var orderId = p.Account?.OrderId;
-            if (string.IsNullOrEmpty(orderId))
-                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
+            var orderId = await RequireOrderAsync(p.Account, p.Amount);
 
-            // 1. Check if Transaction exists
-            var existing = await _transactionStore.GetAsync(p.Id);
+            var active = await _store.GetByOrderIdAsync(orderId);
+            if (active?.State == (int)TransactionState.Created)
+                throw new PaymeException(PaymeErrorCodes.Pending, PaymeErrors.Pending, "order_id");
+            if (active?.State == (int)TransactionState.Completed)
+                throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState, "order_id");
 
+            return new CheckPerformTransactionResult { Allow = true, Detail = await _orders.GetDetailAsync(orderId) };
+        }
+
+        private async Task<CreateTransactionResult> CreateTransactionAsync(CreateTransactionDto p)
+        {
+            var existing = await _store.GetAsync(p.Id);
             if (existing != null)
             {
-                if (existing.OrderId != orderId || existing.Amount != p.Amount)
-                {
+                if (existing.State != (int)TransactionState.Created)
                     throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
-                }
 
-                if (existing.State == (int)TransactionState.Created)
-                {
-                    return new CreateTransactionResult
-                    {
-                        CreateTime = existing.CreateTime,
-                        Transaction = existing.Id,
-                        State = existing.State
-                    };
-                }
-                else
-                {
+                if (await CancelIfExpiredAsync(existing))
                     throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
-                }
+
+                return new CreateTransactionResult { CreateTime = existing.CreateTime, Transaction = existing.Id, State = existing.State };
             }
 
-            // 2. Check Perform Conditions (Order exists, amount correct, not paid)
-            if (!await _orderService.ExistsAsync(orderId))
-                throw new PaymeException(PaymeErrorCodes.OrderNotFound, PaymeErrors.OrderNotFound, "order_id");
+            var orderId = await RequireOrderAsync(p.Account, p.Amount);
 
-            var amount = await _orderService.GetAmountAsync(orderId);
-            if (amount != p.Amount)
-                throw new PaymeException(PaymeErrorCodes.WrongAmount, PaymeErrors.WrongAmount, "amount");
-
-            var activeTrans = await _transactionStore.GetByOrderIdAsync(orderId);
-            if (activeTrans != null)
+            // One-time order: a second Payme transaction for it while the first is open is refused.
+            var active = await _store.GetByOrderIdAsync(orderId);
+            if (active != null && active.Id != p.Id)
             {
-                if (activeTrans.State == (int)TransactionState.Completed)
-                    throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState);
-
-                if (activeTrans.State == (int)TransactionState.Created)
-                    throw new PaymeException(PaymeErrorCodes.InProgress, PaymeErrors.InProgress);
+                if (active.State == (int)TransactionState.Completed)
+                    throw new PaymeException(PaymeErrorCodes.TerminalState, PaymeErrors.TerminalState, "order_id");
+                if (active.State == (int)TransactionState.Created && !await CancelIfExpiredAsync(active))
+                    throw new PaymeException(PaymeErrorCodes.Pending, PaymeErrors.Pending, "order_id");
             }
 
-            await _transactionStore.CreateAsync(p.Id, orderId, p.Time, p.Amount);
-
-            return new CreateTransactionResult
-            {
-                CreateTime = p.Time,
-                Transaction = p.Id,
-                State = (int)TransactionState.Created
-            };
+            var createTime = Now;
+            await _store.CreateAsync(p.Id, orderId, p.Time, p.Amount, createTime);
+            return new CreateTransactionResult { CreateTime = createTime, Transaction = p.Id, State = (int)TransactionState.Created };
         }
 
-        private async Task<PerformTransactionResult> HandlePerformTransactionAsync(object requestParams)
+        private async Task<PerformTransactionResult> PerformTransactionAsync(PerformTransactionDto p)
         {
-            var p = DeserializeParams<PerformTransactionDto>(requestParams);
-            var trans = await _transactionStore.GetAsync(p.Id);
-
-            if (trans == null)
-            {
-                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
-            }
-
-            // State Machine
-            if (trans.State == (int)TransactionState.Created)
-            {
-                if (DateTimeOffset.Now.ToUnixTimeMilliseconds() - trans.CreateTime > 43200000)
-                {
-                    await _transactionStore.CancelAsync(trans.Id, DateTimeOffset.Now.ToUnixTimeMilliseconds(), -1,
-                        (int)TransactionState.Cancelled);
-                    throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
-                }
-
-                await _orderService.MarkAsPaidAsync(trans.OrderId);
-                var performTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-                await _transactionStore.PerformAsync(trans.Id, performTime);
-
-                return new PerformTransactionResult
-                {
-                    PerformTime = performTime,
-                    Transaction = trans.Id,
-                    State = (int)TransactionState.Completed
-                };
-            }
+            var trans = await _store.GetAsync(p.Id)
+                        ?? throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
 
             if (trans.State == (int)TransactionState.Completed)
-            {
-                return new PerformTransactionResult
-                {
-                    PerformTime = trans.PerformTime,
-                    Transaction = trans.Id,
-                    State = (int)TransactionState.Completed
-                };
-            }
+                return new PerformTransactionResult { PerformTime = trans.PerformTime, Transaction = trans.Id, State = trans.State };
 
-            throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
+            if (trans.State != (int)TransactionState.Created || await CancelIfExpiredAsync(trans))
+                throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
+
+            var performTime = Now;
+            await _orders.MarkAsPaidAsync(trans.OrderId);
+            await _store.PerformAsync(trans.Id, performTime);
+            return new PerformTransactionResult { PerformTime = performTime, Transaction = trans.Id, State = (int)TransactionState.Completed };
         }
 
-        private async Task<CancelTransactionResult> HandleCancelTransactionAsync(object requestParams)
+        private async Task<CancelTransactionResult> CancelTransactionAsync(CancelTransactionDto p)
         {
-            var p = DeserializeParams<CancelTransactionDto>(requestParams);
-            var trans = await _transactionStore.GetAsync(p.Id);
+            var trans = await _store.GetAsync(p.Id)
+                        ?? throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
 
-            if (trans == null)
-            {
-                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
-            }
+            if (trans.State == (int)TransactionState.Cancelled || trans.State == (int)TransactionState.CancelledAfterComplete)
+                return new CancelTransactionResult { CancelTime = trans.CancelTime, Transaction = trans.Id, State = trans.State };
 
-            // Already Cancelled
-            if (trans.State == (int)TransactionState.Cancelled ||
-                trans.State == (int)TransactionState.CancelledAfterComplete)
-            {
-                return new CancelTransactionResult
-                {
-                    CancelTime = trans.CancelTime,
-                    Transaction = trans.Id,
-                    State = trans.State
-                };
-            }
-
-            // Cancel logic
-            var cancelTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-
+            int newState;
             if (trans.State == (int)TransactionState.Created)
             {
-                // Just cancel
-                await _transactionStore.CancelAsync(trans.Id, cancelTime, p.Reason, (int)TransactionState.Cancelled);
-                return new CancelTransactionResult
-                {
-                    CancelTime = cancelTime,
-                    Transaction = trans.Id,
-                    State = (int)TransactionState.Cancelled
-                };
+                newState = (int)TransactionState.Cancelled;
             }
-
-            if (trans.State == (int)TransactionState.Completed)
+            else if (trans.State == (int)TransactionState.Completed)
             {
-                throw new PaymeException(PaymeErrorCodes.CantCancel, PaymeErrors.UnableToCancel);
+                if (!await _orders.CanCancelAfterPerformAsync(trans.OrderId))
+                    throw new PaymeException(PaymeErrorCodes.CantCancel, PaymeErrors.UnableToCancel);
+                newState = (int)TransactionState.CancelledAfterComplete;
+            }
+            else
+            {
+                throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
             }
 
-            throw new PaymeException(PaymeErrorCodes.UnableToComplete, PaymeErrors.UnableToComplete);
+            var cancelTime = Now;
+            await _orders.CancelAsync(trans.OrderId, p.Reason);
+            await _store.CancelAsync(trans.Id, cancelTime, p.Reason, newState);
+            return new CancelTransactionResult { CancelTime = cancelTime, Transaction = trans.Id, State = newState };
         }
 
-        private async Task<CheckTransactionResult> HandleCheckTransactionAsync(object requestParams)
+        private async Task<CheckTransactionResult> CheckTransactionAsync(CheckTransactionDto p)
         {
-            var p = DeserializeParams<CheckTransactionDto>(requestParams);
-            var trans = await _transactionStore.GetAsync(p.Id);
-
-            if (trans == null)
-                throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
+            var t = await _store.GetAsync(p.Id)
+                    ?? throw new PaymeException(PaymeErrorCodes.TransactionNotFound, PaymeErrors.TransactionNotFound);
 
             return new CheckTransactionResult
             {
-                CreateTime = trans.CreateTime,
-                PerformTime = trans.PerformTime,
-                CancelTime = trans.CancelTime,
-                Transaction = trans.Id,
-                State = trans.State,
-                Reason = trans.Reason == 0 ? null : (int?)trans.Reason
+                CreateTime = t.CreateTime, PerformTime = t.PerformTime, CancelTime = t.CancelTime,
+                Transaction = t.Id, State = t.State, Reason = t.Reason
             };
         }
 
-        private T DeserializeParams<T>(object urlParams)
+        private async Task<StatementResult> GetStatementAsync(GetStatementDto p)
+        {
+            var list = await _store.GetByPaymeTimeRangeAsync(p.From, p.To);
+            return new StatementResult
+            {
+                Transactions = list.OrderBy(t => t.Time).Select(t => new StatementTransaction
+                {
+                    Id = t.Id, Time = t.Time, Amount = t.Amount, Account = new PaymeAccount { OrderId = t.OrderId },
+                    CreateTime = t.CreateTime, PerformTime = t.PerformTime, CancelTime = t.CancelTime,
+                    Transaction = t.Id, State = t.State, Reason = t.Reason
+                }).ToList()
+            };
+        }
+
+        /// <summary>Cancels a Created transaction older than the timeout (reason 4). True if it did.</summary>
+        private async Task<bool> CancelIfExpiredAsync(PaymeTransaction t)
+        {
+            if (t.State != (int)TransactionState.Created || Now - t.CreateTime <= TimeoutMs)
+                return false;
+
+            await _orders.CancelAsync(t.OrderId, CancelReason.Timeout);
+            await _store.CancelAsync(t.Id, Now, CancelReason.Timeout, (int)TransactionState.Cancelled);
+            t.State = (int)TransactionState.Cancelled;
+            return true;
+        }
+
+        private static T Params<T>(object raw)
         {
             try
             {
-                return JsonConvert.DeserializeObject<T>(urlParams.ToString()!) ?? throw new Exception("Null Params");
+                var token = raw as JToken ?? JToken.FromObject(raw);
+                return token.ToObject<T>() ?? throw new PaymeException(PaymeErrorCodes.InvalidRequest, "Invalid params");
             }
-            catch
+            catch (JsonException)
             {
-                // Payme sometimes sends parameters not as expected object?
-                // JObject?
-                // Actually the `object params` in JsonRpcRequest might be JObject if we use Newtonsoft.
-
-                if (urlParams is Newtonsoft.Json.Linq.JObject jo)
-                {
-                    return jo.ToObject<T>() ?? throw new Exception();
-                }
-
-                return JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(urlParams)) ??
-                       throw new Exception();
+                throw new PaymeException(PaymeErrorCodes.InvalidRequest, "Invalid params");
             }
         }
     }

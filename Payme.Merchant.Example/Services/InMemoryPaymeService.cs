@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using System.Collections.Concurrent;
 using System.Linq;
@@ -63,7 +64,7 @@ namespace Payme.Merchant.Example.Services
             return Task.CompletedTask;
         }
 
-        public Task CreateAsync(string paymeTransactionId, string orderId, long time, long amount)
+        public Task CreateAsync(string paymeTransactionId, string orderId, long time, long amount, long createTime)
         {
             var t = new PaymeTransaction
             {
@@ -71,7 +72,7 @@ namespace Payme.Merchant.Example.Services
                 OrderId = orderId,
                 Time = time,
                 Amount = amount,
-                CreateTime = time,
+                CreateTime = createTime,
                 State = (int)TransactionState.Created
             };
             _transactions.TryAdd(paymeTransactionId, t);
@@ -86,7 +87,7 @@ namespace Payme.Merchant.Example.Services
 
         public Task<PaymeTransaction?> GetByOrderIdAsync(string orderId)
         {
-            var t = _transactions.Values.FirstOrDefault(x => x.OrderId == orderId);
+            var t = _transactions.Values.Where(x => x.OrderId == orderId).OrderByDescending(x => x.CreateTime).FirstOrDefault();
             return Task.FromResult(t);
         }
 
@@ -111,6 +112,12 @@ namespace Payme.Merchant.Example.Services
             }
 
             return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<PaymeTransaction>> GetByPaymeTimeRangeAsync(long from, long to)
+        {
+            IReadOnlyList<PaymeTransaction> list = _transactions.Values.Where(x => x.Time >= from && x.Time <= to).ToList();
+            return Task.FromResult(list);
         }
 
         private class Order

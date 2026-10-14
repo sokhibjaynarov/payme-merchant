@@ -6,6 +6,7 @@ namespace Payme.Merchant.Models
     public const int AccessDenied = -32504;
     public const int MethodNotFound = -32601;
     public const int InvalidJson = -32700;
+    public const int InvalidRequest = -32600;
     public const int SystemError = -32400;
 
     public const int OrderNotFound = -31050;
