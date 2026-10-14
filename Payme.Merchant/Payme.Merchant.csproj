@@ -3,6 +3,10 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <PackageId>Payme.Merchant</PackageId>
+    <Version>0.2.0</Version>
+    <Description>Payme (Paycom) Merchant API for .NET</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -10,6 +14,7 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.1" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="Microsoft.Bcl.TimeProvider" Version="8.0.1" />
   </ItemGroup>
 
 </Project>

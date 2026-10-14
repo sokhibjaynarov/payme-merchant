@@ -1,11 +1,16 @@
+using System;
+
 namespace Payme.Merchant.Configuration
 {
     public class PaymeOptions
     {
-        public string Login { get; set; } = "Paycom"; // Default for Payme
-        public string Password { get; set; } = default!; // The Secret Key
-        public string Key { get; set; } = default!; // Sometimes referred to as Key or Password in different integrations. We'll use Password as the Secret.
+        /// <summary>Always "Paycom" for the Merchant API.</summary>
+        public string Login { get; set; } = "Paycom";
 
-        // Timeout for operations if needed, but usually we just process immediately.
+        /// <summary>The merchant key from the Payme cabinet (test key in the sandbox).</summary>
+        public string Password { get; set; } = default!;
+
+        /// <summary>A created transaction that is not performed within this time is cancelled (reason 4).</summary>
+        public TimeSpan TransactionTimeout { get; set; } = TimeSpan.FromHours(12);
     }
 }
