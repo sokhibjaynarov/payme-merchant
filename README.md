@@ -33,11 +33,13 @@ This library provides a complete implementation of the [Payme Merchant API](http
 
 Add the `Payme.Merchant` project to your solution and reference it.
 
-### Option 2: NuGet Package (Coming Soon)
+### Option 2: NuGet Package
 
 ```bash
-dotnet add package Payme.Merchant
+dotnet add package Payme.Merchant --version 2.0.0
 ```
+
+Version 2.0.0 is a breaking update from the previously published 1.0.0. See the [changelog](CHANGELOG.md) for breaking changes and a migration guide.
 
 ## Quick Start
 
